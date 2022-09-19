@@ -2767,6 +2767,8 @@ typedef u8 (APIENTRY* dll_run_target)(char**, u32, char*, u32);
 typedef void (APIENTRY *dll_write_to_testcase)(char*, s32, const void*, u32);
 typedef u8 (APIENTRY* dll_mutate_testcase)(char**, u8*, u32, u8 (*)(char **, u8*, u32));
 typedef u8 (APIENTRY* dll_trim_testcase)(u32*, u32, u8*, u8*, void (*)(void*, u32), u8 (*)(char**, u32), char**, u32);
+typedef u8 (APIENTRY* dll_run_target_pt)(char*, long, uint32_t, PVOID*);
+typedef void (APIENTRY* dll_build_address_ranges_pt)(PVOID*, u32*, PVOID*);
 
 // Parameters: argv, in_buf, buffer_length, mutation_iterations, common_fuzz_stuff
 typedef u8 (APIENTRY* dll_mutate_testcase_with_energy)(char**, u8*, u32, u32, u8 (*)(char **, u8*, u32));
@@ -2779,6 +2781,8 @@ dll_write_to_testcase dll_write_to_testcase_ptr = NULL;
 dll_mutate_testcase dll_mutate_testcase_ptr = NULL;
 dll_trim_testcase dll_trim_testcase_ptr = NULL;
 dll_mutate_testcase_with_energy dll_mutate_testcase_with_energy_ptr = NULL;
+dll_run_target_pt dll_run_target_pt_ptr = NULL;
+dll_build_address_ranges_pt dll_build_address_ranges_pt_ptr = NULL;
 
 char *get_test_case(long *fsize)
 {
@@ -2830,7 +2834,27 @@ static u8 run_target(char** argv, u32 timeout) {
 
 #ifdef INTELPT
 	if (use_intelpt) {
-		return run_target_pt(argv, timeout);
+    if (dll_run_target_pt_ptr) {
+      long fsize;
+      char *buf = get_test_case(&fsize);
+      PVOID pt_trace = NULL;
+      u8 pt_fault = dll_run_target_pt_ptr(buf, fsize, timeout, &pt_trace);
+      PVOID pt_image = NULL;
+      if (dll_build_address_ranges_pt_ptr) {
+        PVOID ranges;
+        u32 count;
+        PVOID images;
+        dll_build_address_ranges_pt_ptr(&ranges, &count, &images);
+        set_address_ranges(ranges, count);
+        set_image_pt(ranges, count, images);
+        minimize_ranges();
+      }
+      parse_pt_trace(pt_trace);
+      return pt_fault;
+    }
+    else {
+      return run_target_pt(argv, timeout);
+    }
 	}
 #endif
 
@@ -8135,6 +8159,14 @@ void load_custom_library(const char *libname)
   // Get pointer to user-defined dll_mutate_testcase_with_energy_ptr function using GetProcAddress:
   dll_mutate_testcase_with_energy_ptr = (dll_mutate_testcase_with_energy)GetProcAddress(hLib, "dll_mutate_testcase_with_energy");
   SAYF("dll_mutate_testcase_with_energy %s defined.\n", dll_mutate_testcase_with_energy_ptr ? "is" : "isn't");
+
+  // Get pointer to user-defined dll_run_target_pt_ptr function using GetProcAddress:
+  dll_run_target_pt_ptr = (dll_run_target_pt)GetProcAddress(hLib, "dll_run_target_pt");
+  SAYF("dll_run_target_pt %s defined.\n", dll_run_target_pt_ptr ? "is" : "isn't");
+
+  // Get pointer to user-defined dll_build_address_ranges_pt_ptr function using GetProcAddress:
+  dll_build_address_ranges_pt_ptr = (dll_build_address_ranges_pt)GetProcAddress(hLib, "dll_build_address_ranges_pt");
+  SAYF("dll_build_address_ranges_pt_ptr %s defined.\n", dll_build_address_ranges_pt_ptr ? "is" : "isn't");
 
   SAYF("Sucessfully loaded and initalized\n");
 }

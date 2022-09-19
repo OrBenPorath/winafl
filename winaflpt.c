@@ -115,6 +115,10 @@ static bool need_build_ranges = true;
 
 static size_t last_ring_buffer_offset = 0;
 
+static int cached_isid = -1;
+
+struct pt_image *fixed_image = NULL;
+
 #define USAGE_CHECK(condition, message) if(!(condition)) FATAL("%s\n", message);
 
 enum {
@@ -289,6 +293,121 @@ int address_range_compare(const void * a, const void * b) {
 	else return -1;
 }
 
+void print_ranges()
+{
+	printf("%lld ranges:\n", num_ip_ranges);
+
+	for (size_t i = 0; i < num_ip_ranges; i++)
+	{
+		printf("range[%lld]: start=%p end=%p collect=%ld\n", 
+				i, (PVOID)coverage_ip_ranges[i].start, (PVOID)coverage_ip_ranges[i].end, coverage_ip_ranges[i].collect);
+	}
+}
+
+void set_address_ranges(PVOID ranges, u32 count) {
+	if (coverage_ip_ranges == NULL)
+	{
+		printf("set_address_ranges - starting\n");
+		num_ip_ranges = count;
+		coverage_ip_ranges = (address_range*)ranges;
+
+		print_ranges();
+	}
+}
+
+void minimize_ranges() {
+	if (!need_build_ranges)
+	{
+		return;
+	}
+
+	need_build_ranges = false;
+
+	address_range* first_range_to_save = coverage_ip_ranges;
+	address_range* last_range_to_save = coverage_ip_ranges;
+	address_range* current_range = coverage_ip_ranges;
+	address_range* write_to_range = coverage_ip_ranges;
+
+	u32 new_num_ip_ranges = 0;
+
+	for (u32 range_index = 0; range_index < num_ip_ranges; range_index++)
+	{
+		current_range = coverage_ip_ranges + range_index;
+		if (current_range->collect == first_range_to_save->collect)
+		{
+			last_range_to_save = current_range;
+		}
+		else
+		{
+			write_to_range->start = first_range_to_save->start;
+			write_to_range->end = last_range_to_save->end;
+			write_to_range->collect = first_range_to_save->collect;
+
+			write_to_range++;
+			new_num_ip_ranges++;
+
+			first_range_to_save = current_range;
+			last_range_to_save = current_range;
+		}
+	}
+
+	write_to_range->start = first_range_to_save->start;
+	write_to_range->end = last_range_to_save->end;
+	write_to_range->collect = first_range_to_save->collect;
+
+	num_ip_ranges = new_num_ip_ranges + 1;
+
+	print_ranges();
+}
+
+VOID set_image_pt(PVOID ranges, u64 count, PVOID images) {
+	u64 i;
+	u64 size;
+	PVOID image_buffer_address;
+	PVOID * image_addresses = (PVOID *)images;
+
+	// printf("set_image_pt - starting\n");
+	if (fixed_image == NULL) {
+		coverage_ip_ranges = (address_range*)ranges;
+
+		printf("set_image_pt - first time! inside (fixed_image == NULL)\n");
+
+		fixed_image = pt_image_alloc("winafl_image");
+		printf("set_image_pt - after pt_image_alloc pt_image=%p\n", fixed_image);
+
+		for (i = 1; i < count; i += 2)
+		{
+			image_buffer_address = image_addresses[i];
+			size = coverage_ip_ranges[i].end - coverage_ip_ranges[i].start;
+
+			printf("set_image_pt - first time! adding image[%lld]. image_buffer_address=%p address=%016llx size=%016llx\n", 
+			i, image_buffer_address, coverage_ip_ranges[i].start, size);
+
+			char tmpfilename[MAX_PATH];
+			sprintf(tmpfilename, "%s\\sectioncache_%p.dat", section_cache_dir, image_buffer_address);
+
+			// this is pretty horrible, writing a file only to be read again
+			// but libipt only supports reading sections from file, not memory
+			FILE *fp = fopen(tmpfilename, "wb");
+			if (!fp) {
+				FATAL("Error opening image cache file.");
+			}
+			fwrite(image_buffer_address, 1, size, fp);
+			fclose(fp);
+
+			cached_isid = pt_iscache_add_file(section_cache, tmpfilename, 0, size, coverage_ip_ranges[i].start);
+
+			printf("set_image_pt - first time! after pt_iscache_add_file cached_isid=%ld\n", cached_isid);
+
+			int ret = pt_image_add_cached(fixed_image, section_cache, cached_isid, NULL);
+			printf("set_image_pt - after pt_image_add_cached ret=%ld\n", ret);
+		}
+	}
+	
+	// return fixed_image;
+}
+
+
 void build_address_ranges() {
 	int num_loaded_modules;
 	module_info_t *current_module;
@@ -441,7 +560,7 @@ bool collect_thread_trace(PIPT_TRACE_HEADER traceHeader) {
 
 // parse PIPT_TRACE_DATA, extract trace bits and add them to the trace_buffer
 // returns true if the trace ring buffer overflowed
-bool collect_trace(PIPT_TRACE_DATA pTraceData)
+bool collect_trace(PIPT_TRACE_DATA pTraceData, bool match_thread)
 {
 	bool trace_buffer_overflow = false;
 
@@ -453,7 +572,7 @@ bool collect_trace(PIPT_TRACE_DATA pTraceData)
 	traceHeader = (PIPT_TRACE_HEADER)pTraceData->TraceData;
 
 	while (dwTraceSize > (unsigned)(FIELD_OFFSET(IPT_TRACE_HEADER, Trace))) {
-		if (traceHeader->ThreadId == fuzz_thread_id) {
+		if (traceHeader->ThreadId == fuzz_thread_id || !match_thread) {
 			trace_buffer_overflow = collect_thread_trace(traceHeader);
 		}
 
@@ -1474,7 +1593,7 @@ int run_target_pt(char **argv, uint32_t timeout) {
 	if (!trace_data) {
 		printf("Error getting ipt trace\n");
 	} else {
-		trace_buffer_overflowed = collect_trace(trace_data);
+		trace_buffer_overflowed = collect_trace(trace_data, TRUE);
 		HeapFree(GetProcessHeap(), 0, trace_data);
 	}
 
@@ -1562,6 +1681,30 @@ int run_target_pt(char **argv, uint32_t timeout) {
 	}
 
 	return ret;
+}
+
+void parse_pt_trace(PVOID trace) {
+	if (need_build_ranges) {
+		build_address_ranges();
+		need_build_ranges = false;
+	}
+
+	address_range* target_coverage_ip = coverage_ip_ranges + 1;
+
+	// collect trace
+	memset(trace_bits, 0, MAP_SIZE);
+	bool trace_buffer_overflowed = false;
+	PIPT_TRACE_DATA trace_data = (PIPT_TRACE_DATA)trace;
+	if (!trace_data) {
+		printf("Error getting ipt trace\n");
+	} else {
+		collect_trace(trace_data, FALSE);
+	}
+	
+	// FIXME: for now only supports full reference decoding
+	if (options.decoder == DECODER_FULL_REFERENCE) {
+		analyze_trace_full_reference(trace_buffer, trace_size, options.coverage_kind, fixed_image, FALSE);
+	}
 }
 
 int pt_init(int argc, char **argv, char *module_dir) {
